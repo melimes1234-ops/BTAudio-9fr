@@ -29,7 +29,7 @@ struct app{
  struct second{u32 seq,t,pkts,refused,failed,late8,late16,late50,maxgap_us,maxsend_us,maxback_ms,peak;}secs[128],cur;
  u32 sec_seq;u64 sec_start,last_send;int joint;u64 refused_since;u32 relinks,relinks_total;
  int auto_recover,recovery_warned;unsigned recover_ms,recover_limit,sender_sleep_us;
- u64 stream_at,test_until,test_next;u32 test_phase;
+ u64 stream_at,test_until,test_next;u32 test_phase;u64 capture_idle_since;u32 last_writepos;int capture_active;
  void*mutex;int(*mlock)(void**);int(*munlock)(void**);volatile int sender_run,sender_alive;int sender_prio;long thread_rc,prio_rc,aff_rc,pi_rc;
  /* Truthful link state (see link_state). dropped: the link was lost while
   * streaming. failed: the last attempt failed. announced: a "disconnected"
@@ -269,7 +269,7 @@ static void start_audio(struct app*a){
   if(wlog_begin(a,a->clock(),"ERR shm_format")){wlog_raw(a,"hdr=");wlog_hex(a,*(volatile u32*)a->ring);wlog_raw(a," readpos=");wlog_hex(a,a->readpos);wlog_end(a,1);}
   retry(a,"The PS4 audio stream has an unexpected format.");return;
  }
- a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->test_until=0;a->test_next=0;a->test_phase=0;
+ a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->last_writepos=a->readpos;a->capture_idle_since=0;a->capture_active=0;a->test_until=0;a->test_next=0;a->test_phase=0;
  a->health_at=a->stream_at+10000000;a->health_resyncs=a->resyncs;a->health_ok_skips=0;memset(&a->health,0,sizeof(a->health));a->refused_warned=0;a->err_warned=0;
  int was_dropped=a->dropped,told=a->announced,fresh=!a->session;
  a->attempts=0;a->failed=0;a->dropped=0;a->announced=0;a->session=1;a->ok_at=a->stream_at;a->meter=0;a->meter_peak=0;
@@ -411,6 +411,24 @@ static void audio_tick(struct app*a,u64 now){
   if(writepos<16||writepos>=0x10000||(writepos&7)){
    if(wlog_begin(a,now,"WARN ring_reset")){wlog_raw(a,"writepos=");wlog_hex(a,writepos);wlog_raw(a," readpos=");wlog_hex(a,a->readpos);wlog_end(a,1);}
    restart_audio(a,"Audio stream changed. Reconnecting...");return;
+  }
+  /* A game can rebuild or stall the shared capture stream while the Bluetooth
+   * link remains healthy. Previously an unchanged, valid write pointer caused
+   * an endless silent wait because available<1536 simply returned forever.
+   * Watch for a capture pointer that stops advancing after audio has started. */
+  if(writepos!=a->last_writepos){
+   a->last_writepos=writepos;a->capture_idle_since=0;a->capture_active=1;
+  }else if(a->capture_active){
+   if(!a->capture_idle_since)a->capture_idle_since=now;
+   else if(now-a->capture_idle_since>1200000){
+    if(wlog_begin(a,now,"WARN capture_stall")){
+     wlog_raw(a,"idle_ms=");wlog_dec(a,(long)((now-a->capture_idle_since)/1000));
+     wlog_raw(a," writepos=");wlog_hex(a,writepos);
+     wlog_raw(a," readpos=");wlog_hex(a,a->readpos);wlog_end(a,1);
+    }
+    restart_audio(a,"Game audio stream stalled. Recovering audio...");
+    return;
+   }
   }
   unsigned available=writepos>=a->readpos?writepos-a->readpos:0xfff0-a->readpos+writepos;
   if(available>0xc000){
@@ -679,7 +697,7 @@ static void network_tick(struct app*a,u64 now){
    if(n==0||(n<0&&n!=-35)){closefd(c->fd);c->fd=-1;continue;}
    if(n>0){c->used+=(unsigned)n;c->input[c->used]=0;if(find(c->input,"\r\n\r\n")){lock_state(a);dispatch(a,c);unlock_state(a);}else if(c->used==sizeof(c->input)-1)response(c,"431 Request Header Fields Too Large","text/plain","Request too large",17);}
   }
-  if(c->total){long n=sc3(4,c->fd,(long)(c->output+c->sent),c->total-c->sent);if(n>0)c->sent+=(unsigned)n;if(c->sent==c->total||(n<0&&n!=-35)){closefd(c->fd);c->fd=-1;}}
+  if(c->total){unsigned remaining=c->total-c->sent;unsigned chunk=remaining>4096?4096:remaining;long n=sc3(4,c->fd,(long)(c->output+c->sent),chunk);if(n>0)c->sent+=(unsigned)n;if(c->sent==c->total||(n<0&&n!=-35)){closefd(c->fd);c->fd=-1;}}
  }
 }
 /* Feed the driver the way the PS4's own audio daemon does. orbis_audiod creates its
