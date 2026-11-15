@@ -372,7 +372,7 @@ static void joint_path(u64 address,char out[40]){
  for(int k=0;k<12;k++)out[i++]=hex[(address>>(44-4*k))&15];
  out[i]=0;
 }
-static void load_joint(struct app*a){char p[40];joint_path(a->target.address,p);a->joint=!(a->target.address&&exists(p));}
+static void load_joint(struct app*a){(void)a; a->joint=1;}
 static void audio_tick(struct app*a,u64 now){
  if(!a->streaming){a->last_send=0;return;}
  roll_second(a,now);
