@@ -393,7 +393,7 @@ static int roll_second(struct app*a,u64 now){
     wlog_raw(a," refused=");wlog_dec(a,(long)a->cur.refused);
     wlog_raw(a," pkts=");wlog_dec(a,(long)a->cur.pkts);wlog_end(a,1);
    }
-   a->refused_burst_secs=0;relink(a);return 1;
+   a->refused_burst_secs=0;memset(&a->cur,0,sizeof(a->cur));a->cur.t=(u32)(now/1000000);a->sec_start=now;relink(a);return 1;
   }
   if(!a->refusal_rate_warned){
    a->refusal_rate_warned=1;
