@@ -166,7 +166,7 @@ static void action(const char*path){
  refresh();
 }
 static void volume_change(int amount){
- if(!online)return;int value=state.volume+amount;if(value<0)value=0;if(value>200)value=200;
+ if(!online)return;int value=state.volume+amount;if(value<0)value=0;if(value>400)value=400;
  char path[40];snprintf(path,sizeof(path),"/api/volume/%d",value);action(path);
 }
 static void activate(void){
