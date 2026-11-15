@@ -652,7 +652,7 @@ static void dispatch(struct app*a,struct client*c){
   }
   else if(starts(c->input,"POST /api/settings/no-widen/")){
    unsigned v;if(route_number(c->input,"POST /api/settings/no-widen/",&v)!=1||v>1){response(c,"400 Bad Request","text/plain","Invalid HCI setting.",20);return;}
-   if(v){if(put(NO_WIDEN,"on\\n",3)){response(c,"500 Internal Server Error","text/plain","Cannot save setting.",20);return;}}
+   if(v){if(put(NO_WIDEN,"1",1)){response(c,"500 Internal Server Error","text/plain","Cannot save setting.",20);return;}}
    else if(exists(NO_WIDEN)&&sc3(10,(long)NO_WIDEN,0,0)<0){response(c,"500 Internal Server Error","text/plain","Cannot save setting.",20);return;}
    a->no_widen=(int)v;if(wlog_begin(a,a->clock(),"cmd_setting")){wlog_raw(a,"no_widen=");wlog_dec(a,v);wlog_raw(a," apply=next_connect");wlog_end(a,0);}
   }
