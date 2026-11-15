@@ -194,7 +194,7 @@ static void load_target(struct app*a){
  if(n==sizeof(s)&&s.magic==0x3254454752415442UL&&s.device.address&&!(s.device.address>>48)){s.device.name[95]=0;a->target=s.device;}
 }
 static int save_volume(struct app*a,int volume){
- if(volume<0||volume>200)return -1;unsigned value=(unsigned)volume;
+ if(volume<0||volume>400)return -1;unsigned value=(unsigned)volume;
  if(put("/data/bta_audio/volume.tmp",&value,sizeof(value)))return -1;
  if(sc3(128,(long)"/data/bta_audio/volume.tmp",(long)"/data/bta_audio/volume.bin",0)<0)return -1;
  a->volume=volume;return 0;
@@ -202,7 +202,7 @@ static int save_volume(struct app*a,int volume){
 static void load_volume(struct app*a){
  a->volume=40;unsigned value=101;long fd=sc3(5,(long)"/data/bta_audio/volume.bin",0,0);
  if(fd<0)return;long n=sc3(3,fd,(long)&value,sizeof(value));closefd(fd);
- if(n==sizeof(value)&&value<=200)a->volume=(int)value;
+ if(n==sizeof(value)&&value<=400)a->volume=(int)value;
 }
 #define SETTINGS_MAGIC 0x31535442UL
 struct saved_settings{u32 magic,version,auto_recover,recover_ms,recover_limit,sender_sleep_us;};
@@ -431,7 +431,7 @@ static void apply_volume_boost(struct app*a,short pcm[384],unsigned*peak){
  int target=a->volume,safe=target;
  if(raw_peak&&(u64)raw_peak*(u64)target>32000UL*100UL)safe=(int)(32000UL*100UL/raw_peak);
  if(safe<100)safe=100;
- if(a->gain_pct<100||a->gain_pct>200)a->gain_pct=100;
+ if(a->gain_pct<100||a->gain_pct>400)a->gain_pct=100;
  if(safe<a->gain_pct)a->gain_pct=safe;
  else if(safe>a->gain_pct){a->gain_pct++;if(a->gain_pct>safe)a->gain_pct=safe;}
  unsigned out_peak=0;
@@ -446,6 +446,7 @@ static void apply_volume_boost(struct app*a,short pcm[384],unsigned*peak){
 }
 static void audio_tick(struct app*a,u64 now){
  if(!a->streaming){a->last_send=0;return;}
+ if(a->test_until&&now>=a->test_until){a->test_until=0;message(a,"Test tone finished. Game audio is ready.");}
  if(roll_second(a,now))return;
  short pcm[384];unsigned peak=0;unsigned backlog=0;int base_volume=a->volume>100?100:a->volume;
  if(now<a->test_until){
@@ -541,7 +542,7 @@ static int quiet_for_ms(struct app*a,u64 now){if(!a->streaming||now<a->ok_at)ret
 static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
  struct writer w={out,0,cap};append(&w,"{\"version\":\"" BTA_VERSION "\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
- field(&w,"volume",a->volume);field(&w,"volume_max",200);field(&w,"gain_pct",a->gain_pct);field(&w,"auto_recover",a->auto_recover);field(&w,"recover_ms",a->recover_ms);field(&w,"recover_limit",a->recover_limit);field(&w,"sender_sleep_us",a->sender_sleep_us);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_burst_secs",a->refused_burst_secs);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
+ field(&w,"volume",a->volume);field(&w,"volume_max",400);field(&w,"gain_pct",a->gain_pct);field(&w,"auto_recover",a->auto_recover);field(&w,"recover_ms",a->recover_ms);field(&w,"recover_limit",a->recover_limit);field(&w,"sender_sleep_us",a->sender_sleep_us);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_burst_secs",a->refused_burst_secs);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
  for(unsigned i=0;i<a->devices.count;i++){struct bt_device*d=&a->devices.items[i];if(!bt_is_audio(d)&&d->address!=a->target.address)continue;
@@ -653,7 +654,7 @@ static void dispatch(struct app*a,struct client*c){
  if(starts(c->input,"GET /api/native HTTP/1.")){unsigned n=native_status(a,body);response(c,"200 OK","application/octet-stream",body,n);return;}
  if(starts(c->input,"GET /api/status HTTP/1.")){unsigned n=status(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
  if(starts(c->input,"GET /api/timing HTTP/1.")){unsigned n=timing_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
- if(starts(c->input,"GET /api/log HTTP/1.")){unsigned n=read_log_tail(body,sizeof(body));response(c,"200 OK","text/plain; charset=utf-8",body,n);return;}
+ if(starts(c->input,"GET /api/log HTTP/1.")||starts(c->input,"GET /api/log?")){unsigned n=read_log_tail(body,sizeof(body));response(c,"200 OK","text/plain; charset=utf-8",body,n);return;}
   if(starts(c->input,"GET /api/diagnostics HTTP/1.")){unsigned n=diagnostics_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
  char*control=header(c->input,"x-bta-control");
  if(!starts(c->input,"POST ")||!control||!starts(control,"1\r\n")){response(c,"403 Forbidden","text/plain","Control header required.",24);return;}
@@ -678,7 +679,7 @@ static void dispatch(struct app*a,struct client*c){
  else if(starts(c->input,"POST /api/volume/")){
   const char*p=c->input+17;unsigned value=0,n=0;
   while(p[n]>='0'&&p[n]<='9'&&n<3){value=value*10+(unsigned)(p[n]-'0');n++;}
-  if(!n||value>200||!starts(p+n," HTTP/1.")){response(c,"400 Bad Request","text/plain","Volume must be 0-200.",21);return;}
+  if(!n||value>400||!starts(p+n," HTTP/1.")){response(c,"400 Bad Request","text/plain","Volume must be 0-400.",21);return;}
   if(save_volume(a,(int)value)){response(c,"500 Internal Server Error","text/plain","Cannot save volume.",19);return;}
   if(wlog_begin(a,a->clock(),"cmd_volume")){wlog_raw(a,"vol=");wlog_dec(a,a->volume);wlog_end(a,0);}
  }
