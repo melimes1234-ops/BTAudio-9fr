@@ -5,6 +5,7 @@
 <section class="card"><div class="row"><strong>Headphone volume</strong><output id="volume-label">40%</output></div><input id="volume" aria-label="Headphone volume" type="range" min="0" max="100" step="5" value="40" style="width:100%;margin:24px 0" oninput="document.getElementById('volume-label').textContent=this.value+'%'" onchange="action('volume/'+this.value)"><small>0% mutes the headphones. TV volume is unchanged.</small></section>
 <section class="card"><div class="row"><div><strong>Joint stereo</strong><p id="joint" style="margin-bottom:4px">Reading preference…</p></div><button id="joint-toggle" onclick="toggleJoint()" aria-pressed="false">Turn on</button></div><small style="display:block">Standard stereo, the format headphones agree to when they connect. On by default. Turn it off only if a headphone plays nothing with it. Saved per headphone.</small></section>
 <section class="card"><div class="row"><div><strong>TV sound</strong><p id="tv" style="margin-bottom:4px">Reading preference…</p></div><button id="toggle" onclick="toggleTV()" aria-pressed="false">Toggle TV sound</button></div><small>HDMI audio stays active to keep game capture stable. For earbuds only, mute the monitor itself; HDMI is restored normally when streaming stops.</small></section>
+<section class="card"><div class="row"><strong>Diagnostic report</strong><div><button onclick="refreshLog()">Refresh report</button><button onclick="copyLog()">Copy report</button></div></div><p>Live PS4 worker log · newest 10 KB · no FileZilla required.</p><pre id="log-report" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:560px;overflow:auto;background:#10151e;border:1px solid #334257;border-radius:10px;padding:14px;color:#c9f3df;font:12px/1.55 Consolas,monospace">Loading diagnostic report…</pre><small id="log-updated">Not loaded yet</small></section>
 <p>Open the earbud case and keep the earbuds nearby. If they are connected to your phone, disconnect them there first.</p>
 <button class="quiet" onclick="action('quit')">Shut down BTAudio4</button><footer>Runs on your PS4. You can close this page while playing.<br>After restarting the PS4, run your usual jailbreak. BTAudio4 can then start through GoldHEN AutoRun.<br><span id="footer-version">BTAudio4 __BTA_VERSION__ · PS4</span><span id="release-note"></span></footer></main>
 <script>
@@ -37,6 +38,22 @@ function refresh(){if(exited||busy)return;request('GET','/api/status',function(e
  $('signal').textContent=l===2?(s.quiet_ms>3000?'Connected, but the PS4 is not sending sound yet':(lv>0?'Game audio is reaching the earbuds':'Connected · waiting for game sound')):(l===0?'Ready when you are':'');
 });}
 function action(name){if(busy||exited)return;busy=true;request('POST','/api/'+name,function(err,s){busy=false;if(err){$('notice').textContent=err;return;}if(name==='quit'){exited=true;$('state').textContent='Offline';$('notice').textContent='Bluetooth Audio stopped. TV sound has been restored. Launch the payload to use it again.';return;}refresh();});}
+var logBusy=false;
+function refreshLog(){
+ if(logBusy)return;logBusy=true;
+ var x=new XMLHttpRequest();x.open('GET','/api/log?ts='+Date.now(),true);x.timeout=5000;
+ x.onreadystatechange=function(){if(x.readyState===4){logBusy=false;
+  if(x.status===200){$('log-report').textContent=x.responseText||'(Log is empty)';$('log-updated').textContent='Updated '+new Date().toLocaleTimeString();}
+  else{$('log-report').textContent='Cannot read diagnostic report (HTTP '+x.status+').';}
+ }};
+ x.ontimeout=function(){logBusy=false;$('log-report').textContent='PS4 did not respond.';};x.send(null);
+}
+function copyLog(){
+ var el=$('log-report'),txt=el.textContent||'';
+ if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(txt).then(function(){$('log-updated').textContent='Report copied to clipboard';},function(){selectLog();});}
+ else selectLog();
+}
+function selectLog(){var r=document.createRange();r.selectNodeContents($('log-report'));var sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);$('log-updated').textContent='Report selected. Press Ctrl+C to copy.';}
 function connectSelected(){var v=$('devices').value;if(v)action('select/'+v);}
 function sendPin(){var p=$('pin').value;if(/^[0-9]{1,16}$/.test(p))action('pin/'+p);}
 function toggleJoint(){if(latest)action(latest.joint?'joint-off':'joint-on');}
