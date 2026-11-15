@@ -27,7 +27,7 @@ struct app{
   * sends (4 ms is on time). send: how long the driver call took. backlog: capture audio
   * waiting to be sent. refused: the driver returned 0. failed: it returned an error. */
  struct second{u32 seq,t,pkts,refused,failed,late8,late16,late50,maxgap_us,maxsend_us,maxback_ms,peak;}secs[128],cur;
- u32 sec_seq;u64 sec_start,last_send;int joint;u64 refused_since;u32 relinks,relinks_total;
+ u32 sec_seq;u64 sec_start,last_send;int joint;u64 refused_since;u32 relinks,relinks_total,refused_burst_secs;int refusal_rate_warned;
  int auto_recover,recovery_warned;unsigned recover_ms,recover_limit,sender_sleep_us;
  u64 stream_at,test_until,test_next;u32 test_phase;u64 capture_idle_since,capture_progress_at;u32 last_writepos;int capture_active;
  void*mutex;int(*mlock)(void**);int(*munlock)(void**);volatile int sender_run,sender_alive;int sender_prio;long thread_rc,prio_rc,aff_rc,pi_rc;
@@ -269,7 +269,7 @@ static void start_audio(struct app*a){
   if(wlog_begin(a,a->clock(),"ERR shm_format")){wlog_raw(a,"hdr=");wlog_hex(a,*(volatile u32*)a->ring);wlog_raw(a," readpos=");wlog_hex(a,a->readpos);wlog_end(a,1);}
   retry(a,"The PS4 audio stream has an unexpected format.");return;
  }
- a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->last_writepos=a->readpos;a->capture_idle_since=0;a->capture_progress_at=0;a->capture_active=0;a->test_until=0;a->test_next=0;a->test_phase=0;
+ a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->last_writepos=a->readpos;a->capture_idle_since=0;a->capture_progress_at=0;a->capture_active=0;a->refused_burst_secs=0;a->refusal_rate_warned=0;a->test_until=0;a->test_next=0;a->test_phase=0;
  a->health_at=a->stream_at+10000000;a->health_resyncs=a->resyncs;a->health_ok_skips=0;memset(&a->health,0,sizeof(a->health));a->refused_warned=0;a->err_warned=0;
  int was_dropped=a->dropped,told=a->announced,fresh=!a->session;
  a->attempts=0;a->failed=0;a->dropped=0;a->announced=0;a->session=1;a->ok_at=a->stream_at;a->meter=0;a->meter_peak=0;
@@ -350,8 +350,8 @@ __attribute__((noinline)) static void wlog_stream_summary(struct app*a,u64 now,c
   wlog_end(a,urgent);
  }
 }
-static void roll_second(struct app*a,u64 now){
- if(a->sec_start&&now-a->sec_start<1000000)return;
+static int roll_second(struct app*a,u64 now){
+ if(a->sec_start&&now-a->sec_start<1000000)return 0;
  if(a->sec_start&&(a->cur.pkts||a->cur.maxgap_us)){
   a->cur.seq=++a->sec_seq;a->secs[a->sec_seq%128]=a->cur;
   a->health.pkts+=a->cur.pkts;a->health.refused+=a->cur.refused;a->health.failed+=a->cur.failed;
@@ -378,7 +378,33 @@ static void roll_second(struct app*a,u64 now){
   if(bad||a->health_ok_skips==0){memset(&a->health,0,sizeof(a->health));a->health_resyncs=a->resyncs;}
   a->health_at=now+10000000;
  }
- memset(&a->cur,0,sizeof(a->cur));a->cur.t=(u32)(now/1000000);a->sec_start=now;
+ /* Count consecutive one-second windows with >=20% packet refusal. The old
+  * recovery only saw uninterrupted zero-return streaks, so a stream that
+  * lost one packet in four while accepting the rest never recovered. */
+ if(a->cur.pkts>=100&&a->cur.refused*5>=a->cur.pkts){
+  if(a->refused_burst_secs<0xffffffffU)a->refused_burst_secs++;
+ }else{a->refused_burst_secs=0;a->refusal_rate_warned=0;}
+ unsigned need=(a->recover_ms+999)/1000;if(need<2)need=2;
+ if(a->refused_burst_secs>=need){
+  if(a->auto_recover&&a->relinks<a->recover_limit){
+   if(wlog_begin(a,now,"WARN refusal_rate_relink")){
+    wlog_raw(a,"bad_secs=");wlog_dec(a,(long)a->refused_burst_secs);
+    wlog_raw(a," need_secs=");wlog_dec(a,(long)need);
+    wlog_raw(a," refused=");wlog_dec(a,(long)a->cur.refused);
+    wlog_raw(a," pkts=");wlog_dec(a,(long)a->cur.pkts);wlog_end(a,1);
+   }
+   a->refused_burst_secs=0;relink(a);return 1;
+  }
+  if(!a->refusal_rate_warned){
+   a->refusal_rate_warned=1;
+   message(a,"Bluetooth is refusing many audio packets. Automatic recovery is unavailable or its limit was reached.");
+   if(wlog_begin(a,now,"WARN refusal_rate_paused")){
+    wlog_raw(a,"bad_secs=");wlog_dec(a,(long)a->refused_burst_secs);
+    wlog_raw(a," need_secs=");wlog_dec(a,(long)need);wlog_end(a,1);
+   }
+  }
+ }
+ memset(&a->cur,0,sizeof(a->cur));a->cur.t=(u32)(now/1000000);a->sec_start=now;return 0;
 }
 /* Joint stereo is the default. A headphone can opt out (old dual-channel format) with an
  * empty file /data/bta_audio/dual-off-<address>.
@@ -397,7 +423,7 @@ static void load_joint(struct app*a){
 }
 static void audio_tick(struct app*a,u64 now){
  if(!a->streaming){a->last_send=0;return;}
- roll_second(a,now);
+ if(roll_second(a,now))return;
  short pcm[384];unsigned peak=0;unsigned backlog=0;
  if(now<a->test_until){
   /* Self-paced test tone (works even with no game audio): one 192-frame packet
@@ -491,7 +517,7 @@ static int quiet_for_ms(struct app*a,u64 now){if(!a->streaming||now<a->ok_at)ret
 static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
  struct writer w={out,0,cap};append(&w,"{\"version\":\"" BTA_VERSION "\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
- field(&w,"volume",a->volume);field(&w,"auto_recover",a->auto_recover);field(&w,"recover_ms",a->recover_ms);field(&w,"recover_limit",a->recover_limit);field(&w,"sender_sleep_us",a->sender_sleep_us);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
+ field(&w,"volume",a->volume);field(&w,"auto_recover",a->auto_recover);field(&w,"recover_ms",a->recover_ms);field(&w,"recover_limit",a->recover_limit);field(&w,"sender_sleep_us",a->sender_sleep_us);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_burst_secs",a->refused_burst_secs);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
  for(unsigned i=0;i<a->devices.count;i++){struct bt_device*d=&a->devices.items[i];if(!bt_is_audio(d)&&d->address!=a->target.address)continue;
