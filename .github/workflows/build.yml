@@ -1,0 +1,115 @@
+name: Build PS4 Payload & PKG
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths: ['src/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip pillow matplotlib
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache OpenOrbis toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ..\toolchain\OpenOrbis
+          key: openorbis-v0.5.4-win-v1
+
+      - name: Set up LLVM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolchainRoot = Join-Path (Split-Path -Parent $PWD) 'toolchain'
+          $llvmDst = Join-Path $toolchainRoot 'llvm'
+          New-Item -ItemType Directory -Force -Path $toolchainRoot | Out-Null
+
+          $llvmSrc = 'C:\Program Files\LLVM'
+          if (-not (Test-Path (Join-Path $llvmSrc 'bin\clang.exe')) -or -not (Test-Path (Join-Path $llvmSrc 'bin\ld.lld.exe'))) {
+            choco install llvm --no-progress -y
+          }
+          if (Test-Path $llvmDst) {
+            Remove-Item -Path $llvmDst -Force -Recurse
+          }
+          New-Item -ItemType Junction -Path $llvmDst -Target $llvmSrc | Out-Null
+
+      - name: Install OpenOrbis PS4 Toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolchainRoot = Join-Path (Split-Path -Parent $PWD) 'toolchain'
+          $ooDst = Join-Path $toolchainRoot 'OpenOrbis'
+          New-Item -ItemType Directory -Force -Path $ooDst | Out-Null
+
+          $archive = Join-Path $env:TEMP 'openorbis-toolchain.tar.gz'
+          Invoke-WebRequest -Uri 'https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz' -OutFile $archive
+          tar -xzf $archive -C $ooDst
+
+          # Normalize layout so $ooDst\PS4Toolchain\bin\windows\PkgTool.Core.exe exists
+          if (-not (Test-Path (Join-Path $ooDst 'PS4Toolchain\bin\windows\PkgTool.Core.exe'))) {
+            $nested = Get-ChildItem -Path $ooDst -Directory -Recurse -Filter 'PS4Toolchain' | Select-Object -First 1
+            if ($nested) {
+              Move-Item -Path $nested.FullName -Destination (Join-Path $ooDst 'PS4Toolchain')
+            } elseif (Test-Path (Join-Path $ooDst 'bin\windows\PkgTool.Core.exe')) {
+              $tmp = Join-Path $toolchainRoot 'OpenOrbis_tmp'
+              Move-Item -Path $ooDst -Destination $tmp
+              New-Item -ItemType Directory -Force -Path $ooDst | Out-Null
+              Move-Item -Path $tmp -Destination (Join-Path $ooDst 'PS4Toolchain')
+            } else {
+              throw 'Could not locate PS4Toolchain inside OpenOrbis archive.'
+            }
+          }
+
+      - name: Build payload (BTAudio4-1.5.0.bin)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell -ExecutionPolicy Bypass -File tools/build_app.ps1
+
+      - name: Build & validate PKG
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell -ExecutionPolicy Bypass -File tools/build_native.ps1
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: btaudio4-ps4
+          path: |
+            build/BTAudio4-1.5.0.bin
+            build/BTAudio4-1.5.0.pkg
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.5.0' }}
+          name: BTAudio4 ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.5.0' }}
+          files: |
+            build/BTAudio4-1.5.0.bin
+            build/BTAudio4-1.5.0.pkg
