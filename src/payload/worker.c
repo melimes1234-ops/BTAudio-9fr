@@ -15,7 +15,7 @@ int bta_apply_patch(void);
 static const short SINE32[32]={0,1561,3061,4445,5657,6652,7391,7846,8000,7846,7391,6652,5657,4445,3061,1561,0,-1561,-3061,-4445,-5657,-6652,-7391,-7846,-8000,-7846,-7391,-6652,-5657,-4445,-3061,-1561};
 
 struct audio_req{u64 address;void*samples;u64 length;u32 mode,pad;};
-struct client{long fd;u64 deadline;u32 used,sent,total;char input[2048];char output[20000];};
+struct client{long fd;u64 deadline;u32 used,sent,total;char input[2048];char output[32768];};
 struct app{
  int(*sleep)(unsigned);u64(*clock)(void);int(*shm)(const char*,int,int);
  void*(*map)(void*,u64,int,int,int,u64);int(*unmap)(void*,u64);
