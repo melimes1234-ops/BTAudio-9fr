@@ -481,6 +481,22 @@ static int host_valid(char*request){
  u8 ip[4];for(int i=0;i<4;i++){unsigned n=0,digits=0;while(*p>='0'&&*p<='9'){n=n*10+*p++-'0';if(++digits>3||n>255)return 0;}if(!digits)return 0;ip[i]=n;if(i<3&&*p++!='.')return 0;}
  return local_ip(ip)&&starts(p,":8097\r\n");
 }
+/* Newest 10 KB of app.log, served locally so users do not need FTP. */
+static unsigned read_log_tail(char*out,unsigned cap){
+ if(!cap)return 0;
+ char ring[10000],chunk[512];unsigned used=0,pos=0;
+ long fd=sc3(5,(long)WORKER_LOG,0,0);
+ if(fd<0){const char*m="No diagnostic log yet. Start the audio service first.\n";unsigned n=length(m);if(n>=cap)n=cap-1;memcpy(out,m,n);out[n]=0;return n;}
+ for(;;){long n=sc3(3,fd,(long)chunk,sizeof(chunk));if(n<=0)break;
+  for(long i=0;i<n;i++){ring[pos]=chunk[i];pos=(pos+1)%sizeof(ring);if(used<sizeof(ring))used++;}
+ }
+ closefd(fd);
+ unsigned start=used==sizeof(ring)?pos:0,n=used;
+ if(n>=cap)n=cap-1;
+ if(used>n)start=(start+(used-n))%sizeof(ring);
+ for(unsigned i=0;i<n;i++)out[i]=ring[(start+i)%sizeof(ring)];
+ out[n]=0;return n;
+}
 static void dispatch(struct app*a,struct client*c){
  char body[12000];
  if(!host_valid(c->input)){response(c,"403 Forbidden","text/plain","Use the PS4 IP address.",23);return;}
@@ -488,6 +504,7 @@ static void dispatch(struct app*a,struct client*c){
  if(starts(c->input,"GET /api/native HTTP/1.")){unsigned n=native_status(a,body);response(c,"200 OK","application/octet-stream",body,n);return;}
  if(starts(c->input,"GET /api/status HTTP/1.")){unsigned n=status(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
  if(starts(c->input,"GET /api/timing HTTP/1.")){unsigned n=timing_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
+ if(starts(c->input,"GET /api/log HTTP/1.")){unsigned n=read_log_tail(body,sizeof(body));response(c,"200 OK","text/plain; charset=utf-8",body,n);return;}
  char*control=header(c->input,"x-bta-control");
  if(!starts(c->input,"POST ")||!control||!starts(control,"1\r\n")){response(c,"403 Forbidden","text/plain","Control header required.",24);return;}
  if(starts(c->input,"POST /api/scan HTTP/1.")){if(a->streaming){response(c,"409 Conflict","text/plain","Stop audio before scanning.",27);return;}if(scan(a)){response(c,"503 Service Unavailable","text/plain","Scan could not start",20);return;}}
