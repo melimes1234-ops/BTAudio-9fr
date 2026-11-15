@@ -1,0 +1,24 @@
+BTAudio4 1.5.1 — source patch for low/quiet game audio after entering gameplay
+
+Changes:
+1. HDMI audio is no longer muted while Bluetooth streaming is active. The 1.5.0
+   source itself notes that muting HDMI can leave /shm_acap.full capture empty.
+   Some games rebuild their audio mix after gameplay starts, so this patch keeps
+   the HDMI capture path alive for the whole session.
+2. The built-in test tone lasts 10 seconds instead of 2 seconds, making it easier
+   to capture status.json while test=1.
+3. UI wording explains that HDMI remains active; mute the monitor physically
+   when listening only through earbuds.
+4. Version changed to 1.5.1 so the patched source is distinguishable.
+
+IMPORTANT:
+- This archive contains SOURCE CODE ONLY. It is not a PKG or a ready-to-install
+  PS4 payload.
+- The user's installed app was identified as 1.3.0. This source is based on the
+  separately recovered 1.5.0 source tree; it is not a binary patch for 1.3.0.
+- The upstream README lists tests on firmware 12.50, 13.52 and 14.02. Firmware
+  9.00 / GoldHEN has not been validated here. Do not install a built binary on
+  the 9.00 console until it has been compiled with the proper PS4 toolchain and
+  its firmware/kernel resolver has been checked on that console.
+- For earbud-only use with this patch, set the monitor's own volume to zero or
+  mute it. HDMI audio remains active inside the PS4 so the capture mix survives.
