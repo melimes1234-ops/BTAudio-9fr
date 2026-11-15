@@ -29,7 +29,7 @@ struct app{
  struct second{u32 seq,t,pkts,refused,failed,late8,late16,late50,maxgap_us,maxsend_us,maxback_ms,peak;}secs[128],cur;
  u32 sec_seq;u64 sec_start,last_send;int joint;u64 refused_since;u32 relinks,relinks_total;
  int auto_recover,recovery_warned;unsigned recover_ms,recover_limit,sender_sleep_us;
- u64 stream_at,test_until,test_next;u32 test_phase;u64 capture_idle_since;u32 last_writepos;int capture_active;
+ u64 stream_at,test_until,test_next;u32 test_phase;u64 capture_idle_since,capture_progress_at;u32 last_writepos;int capture_active;
  void*mutex;int(*mlock)(void**);int(*munlock)(void**);volatile int sender_run,sender_alive;int sender_prio;long thread_rc,prio_rc,aff_rc,pi_rc;
  /* Truthful link state (see link_state). dropped: the link was lost while
   * streaming. failed: the last attempt failed. announced: a "disconnected"
@@ -269,7 +269,7 @@ static void start_audio(struct app*a){
   if(wlog_begin(a,a->clock(),"ERR shm_format")){wlog_raw(a,"hdr=");wlog_hex(a,*(volatile u32*)a->ring);wlog_raw(a," readpos=");wlog_hex(a,a->readpos);wlog_end(a,1);}
   retry(a,"The PS4 audio stream has an unexpected format.");return;
  }
- a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->last_writepos=a->readpos;a->capture_idle_since=0;a->capture_active=0;a->test_until=0;a->test_next=0;a->test_phase=0;
+ a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->last_writepos=a->readpos;a->capture_idle_since=0;a->capture_progress_at=0;a->capture_active=0;a->test_until=0;a->test_next=0;a->test_phase=0;
  a->health_at=a->stream_at+10000000;a->health_resyncs=a->resyncs;a->health_ok_skips=0;memset(&a->health,0,sizeof(a->health));a->refused_warned=0;a->err_warned=0;
  int was_dropped=a->dropped,told=a->announced,fresh=!a->session;
  a->attempts=0;a->failed=0;a->dropped=0;a->announced=0;a->session=1;a->ok_at=a->stream_at;a->meter=0;a->meter_peak=0;
@@ -417,7 +417,7 @@ static void audio_tick(struct app*a,u64 now){
    * an endless silent wait because available<1536 simply returned forever.
    * Watch for a capture pointer that stops advancing after audio has started. */
   if(writepos!=a->last_writepos){
-   a->last_writepos=writepos;a->capture_idle_since=0;a->capture_active=1;
+   a->last_writepos=writepos;a->capture_progress_at=now;a->capture_idle_since=0;a->capture_active=1;
   }else if(a->capture_active){
    if(!a->capture_idle_since)a->capture_idle_since=now;
    else if(now-a->capture_idle_since>1200000){
@@ -563,14 +563,18 @@ static unsigned diagnostics_json(struct app*a,char*out,unsigned cap){
  else if(a->streaming||(a->btstate>=5&&a->btstate<=6))diag_item(&w,&first,"device","pass","Bluetooth headphone link","The selected device is connected or streaming.","No action needed.");
  else diag_item(&w,&first,"device",a->wanted?"warn":"wait","Bluetooth headphone link",a->wanted?"Connection is requested but the audio link is not ready.":"A headphone is selected but not connected.","Put the Haylou W1 in its case, disconnect it from the phone, then reconnect.");
  if(a->streaming&&a->ring){
-  u32 wp=(u32)(*(volatile u64*)(a->ring+8)>>32),rp=a->readpos;
+  u64 now=a->clock();u32 wp=(u32)(*(volatile u64*)(a->ring+8)>>32),rp=a->readpos;
   if(wp<16||wp>=0x10000||(wp&7)||rp<16||rp>=0x10000||(rp&7))diag_item(&w,&first,"capture","fail","PS4 game-audio capture","The shared audio ring has an invalid read/write position.","Restart the audio path. If this repeats when a game opens, keep the log and game name for diagnosis.");
-  else{unsigned avail=wp>=rp?wp-rp:0xfff0-rp+wp;diag_item(&w,&first,"capture",avail>=1536?"pass":"wait","PS4 game-audio capture",avail>=1536?"The shared audio ring contains game-audio samples.":"No complete audio packet is ready in the capture ring.","Enter the game and start playback. HDMI capture is kept active to protect the game mix.");}
+  else if(now<a->test_until)diag_item(&w,&first,"capture","wait","PS4 game-audio capture","The test tone bypasses game capture; capture progress is checked after the tone ends.","Wait for the 10-second test tone to finish, then check while game audio is playing.");
+  else if(a->capture_progress_at&&now>=a->capture_progress_at&&now-a->capture_progress_at<=1200000)diag_item(&w,&first,"capture","pass","PS4 game-audio capture","The PS4 capture write pointer has advanced recently. The buffer may be below one packet because the sender drains it continuously.","Capture is active; no action needed.");
+  else if(a->capture_active)diag_item(&w,&first,"capture","warn","PS4 game-audio capture","The capture write pointer has stopped advancing; the audio stream may have stalled.","Automatic recovery should restart the audio path. If it repeats in the same game, keep the full report.");
+  else diag_item(&w,&first,"capture","wait","PS4 game-audio capture","No capture-pointer movement has been observed yet in this connection.","Start audible game playback and allow the capture stream to initialize. HDMI capture is kept active to protect the game mix.");
  }else diag_item(&w,&first,"capture","wait","PS4 game-audio capture","Capture is checked when headphones are streaming.","Connect the headphones and enter a game; use Test sound to separate Bluetooth from game capture.");
  if(!a->streaming)diag_item(&w,&first,"queue","wait","Bluetooth audio queue","No live audio packets are being sent right now.","Connect headphones and run the 10-second tone test.");
- else if(a->cur.failed)diag_item(&w,&first,"queue","fail","Bluetooth audio queue","Driver send errors were seen in the current sample window.","Reconnect Bluetooth. If errors persist, test Skip HCI widening and keep the full report.");
- else if(a->cur.refused||a->cur.late16||a->cur.late50)diag_item(&w,&first,"queue","warn","Bluetooth audio queue","Some packets were refused or sent late in the latest sample window.","Try 250 us polling, then 500 us. If refusal continues, set recovery window to 6 seconds and reconnect.");
- else diag_item(&w,&first,"queue","pass","Bluetooth audio queue","No send refusal or late packet has been recorded in the current sample window.","Repeat the check while in gameplay for at least one minute.");
+ else if(a->cur.failed)diag_item(&w,&first,"queue","fail","Bluetooth audio queue","The Bluetooth driver returned an actual send error in the latest sample window.","Reconnect Bluetooth. If errors persist, keep the full report for driver-level diagnosis.");
+ else if(a->cur.refused)diag_item(&w,&first,"queue","warn","Bluetooth packet acceptance","The PS4 Bluetooth driver refused one or more audio packets in the latest sample window. This does not by itself mean the sender thread was late.","Keep automatic recovery enabled. With a 500 us sender interval, do not change polling just for packet refusals; the app will relink after a continuous refusal reaches the recovery window.");
+ else if(a->cur.late16||a->cur.late50)diag_item(&w,&first,"queue","warn","Bluetooth audio timing","The sender missed audio deadlines in the latest sample window.","Keep the sender interval at 500 us first. Only investigate 250 us polling if timing rows continue to show late packets, not merely driver refusals.");
+ else diag_item(&w,&first,"queue","pass","Bluetooth audio queue","No send refusal or significant late packet has been recorded in the current sample window.","No queue action needed.");
  if(a->prio_rc||a->aff_rc||a->pi_rc<0)diag_item(&w,&first,"schedule","warn","Sender scheduling","One or more real-time scheduling attributes were not accepted.","Use 500 us first. Do not force CPU affinity or priority on unsupported firmware.");
  else diag_item(&w,&first,"schedule","pass","Sender scheduling","Thread scheduling setup returned no recorded errors.","No action needed.");
  diag_item(&w,&first,"settings","pass","Saved settings","Recovery and sender settings are stored on the PS4.","Settings survive restarting the payload.");
