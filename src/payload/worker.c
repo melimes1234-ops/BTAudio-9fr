@@ -362,7 +362,7 @@ static void roll_second(struct app*a,u64 now){
  memset(&a->cur,0,sizeof(a->cur));a->cur.t=(u32)(now/1000000);a->sec_start=now;
 }
 /* Joint stereo is the default. A headphone can opt out (old dual-channel format) with an
- * empty file /data/bta_audio/dual-<address>.
+ * empty file /data/bta_audio/dual-off-<address>.
  * Send type 3 makes the driver encode dual-channel SBC at half bitpool per channel, a
  * format headphones did not agree to at connect, so it renegotiates the stream. Type 4
  * is joint stereo at full bitpool, the format headphones normally agree to. */
