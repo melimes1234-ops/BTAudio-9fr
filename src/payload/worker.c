@@ -367,7 +367,7 @@ static void roll_second(struct app*a,u64 now){
  * format headphones did not agree to at connect, so it renegotiates the stream. Type 4
  * is joint stereo at full bitpool, the format headphones normally agree to. */
 static void joint_path(u64 address,char out[40]){
- const char*hex="0123456789ABCDEF",*base="/data/bta_audio/dual-";unsigned i=0;
+ const char*hex="0123456789ABCDEF",*base="/data/bta_audio/dual-off-";unsigned i=0;
  while(base[i]){out[i]=base[i];i++;}
  for(int k=0;k<12;k++)out[i++]=hex[(address>>(44-4*k))&15];
  out[i]=0;
