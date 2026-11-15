@@ -22,7 +22,7 @@ struct app{
  long listener,bt,hdmi,shmfd;u8*ring;u32 readpos;int wanted,streaming,tv,muted,quit,phase;
  long patch_rc,packet_rc,connect_rc,last_rc,hdmi_rc,btstate,list_rc;
  u64 next_try,deadline,scan_at,heartbeat,poll_at,net_at,packets,errors,resyncs;
- unsigned level;int volume;char message[128];
+ unsigned level;int volume,gain_pct;char message[128];
  /* Per-packet timing, summarised per second (GET /api/timing). gap: time between two
   * sends (4 ms is on time). send: how long the driver call took. backlog: capture audio
   * waiting to be sent. refused: the driver returned 0. failed: it returned an error. */
@@ -194,7 +194,7 @@ static void load_target(struct app*a){
  if(n==sizeof(s)&&s.magic==0x3254454752415442UL&&s.device.address&&!(s.device.address>>48)){s.device.name[95]=0;a->target=s.device;}
 }
 static int save_volume(struct app*a,int volume){
- if(volume<0||volume>100)return -1;unsigned value=(unsigned)volume;
+ if(volume<0||volume>200)return -1;unsigned value=(unsigned)volume;
  if(put("/data/bta_audio/volume.tmp",&value,sizeof(value)))return -1;
  if(sc3(128,(long)"/data/bta_audio/volume.tmp",(long)"/data/bta_audio/volume.bin",0)<0)return -1;
  a->volume=volume;return 0;
@@ -202,7 +202,7 @@ static int save_volume(struct app*a,int volume){
 static void load_volume(struct app*a){
  a->volume=40;unsigned value=101;long fd=sc3(5,(long)"/data/bta_audio/volume.bin",0,0);
  if(fd<0)return;long n=sc3(3,fd,(long)&value,sizeof(value));closefd(fd);
- if(n==sizeof(value)&&value<=100)a->volume=(int)value;
+ if(n==sizeof(value)&&value<=200)a->volume=(int)value;
 }
 #define SETTINGS_MAGIC 0x31535442UL
 struct saved_settings{u32 magic,version,auto_recover,recover_ms,recover_limit,sender_sleep_us;};
@@ -269,7 +269,7 @@ static void start_audio(struct app*a){
   if(wlog_begin(a,a->clock(),"ERR shm_format")){wlog_raw(a,"hdr=");wlog_hex(a,*(volatile u32*)a->ring);wlog_raw(a," readpos=");wlog_hex(a,a->readpos);wlog_end(a,1);}
   retry(a,"The PS4 audio stream has an unexpected format.");return;
  }
- a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->last_writepos=a->readpos;a->capture_idle_since=0;a->capture_progress_at=0;a->capture_active=0;a->refused_burst_secs=0;a->refusal_rate_warned=0;a->test_until=0;a->test_next=0;a->test_phase=0;
+ a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->last_writepos=a->readpos;a->capture_idle_since=0;a->capture_progress_at=0;a->capture_active=0;a->refused_burst_secs=0;a->refusal_rate_warned=0;a->test_until=0;a->test_next=0;a->test_phase=0;a->gain_pct=100;
  a->health_at=a->stream_at+10000000;a->health_resyncs=a->resyncs;a->health_ok_skips=0;memset(&a->health,0,sizeof(a->health));a->refused_warned=0;a->err_warned=0;
  int was_dropped=a->dropped,told=a->announced,fresh=!a->session;
  a->attempts=0;a->failed=0;a->dropped=0;a->announced=0;a->session=1;a->ok_at=a->stream_at;a->meter=0;a->meter_peak=0;
@@ -421,17 +421,40 @@ static void load_joint(struct app*a){
  if(!a->target.address){a->joint=1;return;}
  char p[40];joint_path(a->target.address,p);a->joint=!exists(p);
 }
+/* Post-PCM digital boost for weak game mixes. Apply one uniform gain to the
+ * entire packet, with a 32k peak ceiling. Fast attack prevents clipping; slow
+ * release avoids pumping when loud transients pass. 0..100% remains unchanged. */
+static void apply_volume_boost(struct app*a,short pcm[384],unsigned*peak){
+ if(a->volume<=100){a->gain_pct=100;return;}
+ unsigned raw_peak=0;
+ for(unsigned i=0;i<384;i++){int v=pcm[i];unsigned m=(unsigned)(v<0?-v:v);if(m>raw_peak)raw_peak=m;}
+ int target=a->volume,safe=target;
+ if(raw_peak&&(u64)raw_peak*(u64)target>32000UL*100UL)safe=(int)(32000UL*100UL/raw_peak);
+ if(safe<100)safe=100;
+ if(a->gain_pct<100||a->gain_pct>200)a->gain_pct=100;
+ if(safe<a->gain_pct)a->gain_pct=safe;
+ else if(safe>a->gain_pct){a->gain_pct++;if(a->gain_pct>safe)a->gain_pct=safe;}
+ unsigned out_peak=0;
+ for(unsigned i=0;i<384;i++){
+  long v=(long)pcm[i]*(long)a->gain_pct/100L;
+  if(v>32000)v=32000;
+  if(v< -32000)v= -32000;
+  pcm[i]=(short)v;unsigned m=(unsigned)(v<0?-v:v);if(m>out_peak)out_peak=m;
+ }
+ if(out_peak>*peak)*peak=out_peak;
+ if(out_peak>a->level)a->level=out_peak;
+}
 static void audio_tick(struct app*a,u64 now){
  if(!a->streaming){a->last_send=0;return;}
  if(roll_second(a,now))return;
- short pcm[384];unsigned peak=0;unsigned backlog=0;
+ short pcm[384];unsigned peak=0;unsigned backlog=0;int base_volume=a->volume>100?100:a->volume;
  if(now<a->test_until){
   /* Self-paced test tone (works even with no game audio): one 192-frame packet
    * every ~4ms. Independent of the capture ring; follows the volume slider
    * (50% = the old fixed level, 100% = about half of full scale). */
   if(now<a->test_next)return;
   a->test_next=now+4000;
-  for(unsigned i=0;i<192;i++){short s=(short)(SINE32[(a->test_phase>>8)&31]*2*a->volume/100);a->test_phase+=75;pcm[2*i]=s;pcm[2*i+1]=s;unsigned m=s<0?-s:s;if(m>a->level)a->level=m;if(m>peak)peak=m;}
+  for(unsigned i=0;i<192;i++){short s=(short)(SINE32[(a->test_phase>>8)&31]*2*base_volume/100);a->test_phase+=75;pcm[2*i]=s;pcm[2*i+1]=s;unsigned m=s<0?-s:s;if(m>a->level)a->level=m;if(m>peak)peak=m;}
  }else{
   u32 writepos=(u32)(*(volatile u64*)(a->ring+8)>>32);
   if(writepos<16||writepos>=0x10000||(writepos&7)){
@@ -463,9 +486,10 @@ static void audio_tick(struct app*a,u64 now){
    return;
   }if(available<1536)return;backlog=available;
   u32 cursor=a->readpos;
-  for(unsigned i=0;i<384;i++){float f=*(volatile float*)(a->ring+cursor);cursor+=4;if(cursor==0x10000)cursor=16;if(f!=f)f=0;if(f>1)f=1;if(f<-1)f=-1;int v=(int)(f*(32767.0f*(float)a->volume/100.0f));pcm[i]=(short)v;unsigned m=v<0?-v:v;if(m>a->level)a->level=m;if(m>peak)peak=m;}
+  for(unsigned i=0;i<384;i++){float f=*(volatile float*)(a->ring+cursor);cursor+=4;if(cursor==0x10000)cursor=16;if(f!=f)f=0;if(f>1)f=1;if(f<-1)f=-1;int v=(int)(f*(32767.0f*(float)base_volume/100.0f));pcm[i]=(short)v;unsigned m=v<0?-v:v;if(m>a->level)a->level=m;if(m>peak)peak=m;}
   a->readpos=cursor;
  }
+ apply_volume_boost(a,pcm,&peak);
  struct audio_req req={a->target.address,pcm,sizeof(pcm),a->joint?4:3,0};a->last_rc=sc3(54,a->bt,0x80206216,(long)&req);
  {u64 done=a->clock();struct second*s=&a->cur;s->pkts++;
   if(a->last_rc==0)s->refused++;else if(a->last_rc<0)s->failed++;
@@ -517,7 +541,7 @@ static int quiet_for_ms(struct app*a,u64 now){if(!a->streaming||now<a->ok_at)ret
 static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
  struct writer w={out,0,cap};append(&w,"{\"version\":\"" BTA_VERSION "\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
- field(&w,"volume",a->volume);field(&w,"auto_recover",a->auto_recover);field(&w,"recover_ms",a->recover_ms);field(&w,"recover_limit",a->recover_limit);field(&w,"sender_sleep_us",a->sender_sleep_us);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_burst_secs",a->refused_burst_secs);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
+ field(&w,"volume",a->volume);field(&w,"volume_max",200);field(&w,"gain_pct",a->gain_pct);field(&w,"auto_recover",a->auto_recover);field(&w,"recover_ms",a->recover_ms);field(&w,"recover_limit",a->recover_limit);field(&w,"sender_sleep_us",a->sender_sleep_us);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_burst_secs",a->refused_burst_secs);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
  for(unsigned i=0;i<a->devices.count;i++){struct bt_device*d=&a->devices.items[i];if(!bt_is_audio(d)&&d->address!=a->target.address)continue;
@@ -654,7 +678,7 @@ static void dispatch(struct app*a,struct client*c){
  else if(starts(c->input,"POST /api/volume/")){
   const char*p=c->input+17;unsigned value=0,n=0;
   while(p[n]>='0'&&p[n]<='9'&&n<3){value=value*10+(unsigned)(p[n]-'0');n++;}
-  if(!n||value>100||!starts(p+n," HTTP/1.")){response(c,"400 Bad Request","text/plain","Volume must be 0-100.",21);return;}
+  if(!n||value>200||!starts(p+n," HTTP/1.")){response(c,"400 Bad Request","text/plain","Volume must be 0-200.",21);return;}
   if(save_volume(a,(int)value)){response(c,"500 Internal Server Error","text/plain","Cannot save volume.",19);return;}
   if(wlog_begin(a,a->clock(),"cmd_volume")){wlog_raw(a,"vol=");wlog_dec(a,a->volume);wlog_end(a,0);}
  }
