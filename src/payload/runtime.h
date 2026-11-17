@@ -30,4 +30,5 @@ void* bta_worker(void*);
 /* Diagnostic: if present, skip the 3-slot HCI widening on connect so we can
  * test whether a plain audio link keeps the controller alive. */
 #define NO_WIDEN "/data/bta_audio/no_widen"
+#define NO_MODE0 "/data/bta_audio/no_mode0"
 #endif

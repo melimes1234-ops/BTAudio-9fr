@@ -45,6 +45,11 @@ struct app{
  u64 bt_ev_last_at;u8 bt_ev_last_type,bt_ev_last_sub;u32 bt_ev_last_data;u64 bt_ev_last_addr;
  u32 health_resyncs,health_ok_skips;
  struct second health;
+ /* Stage-by-stage audio path diagnostics (v1.6.6). rc_full: driver queued the whole
+  * packet; rc_partial: queued part of it; rc_zero: refused; rc_neg: error. None of
+  * these prove the headphones played the audio. */
+ u64 pkt_zero,pkt_nonzero,rc_full,rc_partial,rc_zero,rc_neg,last_nonzero_at,last_accept_at,last_recovery_at,last_mode0_at;
+ u32 mode0_sent,recoveries,last_rms,bt_ev_stream;long btstate_recovery;int no_mode0;char last_recovery[24];
 };
 static void lock_state(struct app*a){if(a->mlock)a->mlock(&a->mutex);}
 static void unlock_state(struct app*a){if(a->munlock)a->munlock(&a->mutex);}
@@ -114,7 +119,12 @@ static void mute(struct app*a,int on){
 static void stop_audio(struct app*a){
  int was_streaming=a->streaming;
  if(a->phase==4&&a->bt>=0){sc3(54,a->bt,0x20046205,0);a->scanning=0;}
- if(a->streaming){short silence[384];memset(silence,0,sizeof(silence));struct audio_req q={a->target.address,silence,sizeof(silence),0,0};sc3(54,a->bt,0x80206216,(long)&q);}
+ if(a->streaming){
+  if(a->no_mode0){if(wlog_begin(a,a->clock(),"mode0_skipped")){wlog_raw(a,"reason=NO_MODE0");wlog_end(a,1);}}
+  else{short silence[384];memset(silence,0,sizeof(silence));struct audio_req q={a->target.address,silence,sizeof(silence),0,0};long rc=sc3(54,a->bt,0x80206216,(long)&q);
+   a->mode0_sent++;a->last_mode0_at=a->clock();
+   if(wlog_begin(a,a->last_mode0_at,"mode0_sent")){wlog_raw(a,"rc=");wlog_dec(a,rc);wlog_raw(a," count=");wlog_dec(a,(long)a->mode0_sent);wlog_end(a,1);}}
+ }
  a->streaming=0;a->phase=0;a->level=0;a->meter=0;a->meter_peak=0;a->pin_pending=0;a->test_until=0;mute(a,0);
  if(a->ring){a->unmap(a->ring,0x10000);a->ring=0;}closefd(a->shmfd);a->shmfd=-1;
  if(was_streaming&&wlog_begin(a,a->clock(),"audio_stop")){wlog_raw(a,"packets=");wlog_dec(a,(long)a->packets);wlog_raw(a," resyncs=");wlog_dec(a,(long)a->resyncs);wlog_raw(a," relinks=");wlog_dec(a,(long)a->relinks_total);wlog_end(a,1);}
@@ -128,9 +138,18 @@ static void retry(struct app*a,const char*s){retry_after(a,s,10000000);}
 static void retry_named(struct app*a,const char*pre,const char*suf,u64 delay_us){char m[128];compose(m,sizeof(m),pre,target_name(a),suf);retry_after(a,m,delay_us);}
 /* The PS4 audio stream was rebuilt (e.g. a game started). The headphone link is
  * fine, so this is a quiet reconnect of the audio path, not a failure or a drop. */
+/* Record a recovery: which kind, when, and the driver link state right after the
+ * audio stop (one query, not polling; see bluetooth_tick). */
+static void note_recovery(struct app*a,const char*kind){
+ a->recoveries++;a->last_recovery_at=a->clock();unsigned i=0;while(kind[i]&&i+1<sizeof(a->last_recovery)){a->last_recovery[i]=kind[i];i++;}a->last_recovery[i]=0;
+ long before=a->btstate;
+ if(a->bt>=0&&a->target.address){u64 address=a->target.address;a->btstate_recovery=sc3(54,a->bt,0x80086203,(long)&address);}else a->btstate_recovery=-1;
+ if(wlog_begin(a,a->last_recovery_at,"recovery_state")){wlog_raw(a,"kind=");wlog_raw(a,a->last_recovery);wlog_raw(a," btstate_before=");wlog_dec(a,before);wlog_raw(a," btstate_after=");wlog_dec(a,a->btstate_recovery);
+  wlog_raw(a," nonzero=");wlog_dec(a,(long)a->pkt_nonzero);wlog_raw(a," zero=");wlog_dec(a,(long)a->pkt_zero);wlog_raw(a," rc_full=");wlog_dec(a,(long)a->rc_full);wlog_raw(a," rc_partial=");wlog_dec(a,(long)a->rc_partial);wlog_end(a,1);}
+}
 static void restart_audio(struct app*a,const char*s){
  if(!a->auto_recover){stop_audio(a);a->wanted=0;a->failed=1;message(a,"Audio stream changed. Automatic recovery is disabled.");if(wlog_begin(a,a->clock(),"WARN recovery_disabled")){wlog_raw(a,"reason=audio_stream_reset");wlog_end(a,1);}return;}
- stop_audio(a);message(a,s);a->next_try=a->clock()+2000000;
+ stop_audio(a);note_recovery(a,"restart_audio");message(a,s);a->next_try=a->clock()+2000000;
  if(wlog_begin(a,a->clock(),"restart_audio")){wlog_raw(a,"msg=");wlog_str(a,s);wlog_end(a,1);}
 }
 /* The headphones went away mid-stream. Detected only by consecutive audio-send
@@ -146,12 +165,12 @@ static void drop_link(struct app*a){if(a->bt>=0&&a->target.address){u64 address=
 static void relink(struct app*a){
  a->relinks++;a->relinks_total++;
  if(wlog_begin(a,a->clock(),"WARN relink")){wlog_raw(a,"attempt=");wlog_dec(a,(long)a->relinks);wlog_raw(a," total=");wlog_dec(a,(long)a->relinks_total);wlog_end(a,1);}
- stop_audio(a);drop_link(a);a->phase=0;a->next_try=a->clock()+3000000;a->refused_since=0;
+ stop_audio(a);note_recovery(a,"relink");drop_link(a);a->phase=0;a->next_try=a->clock()+3000000;a->refused_since=0;
  say(a,"The PS4 stopped accepting audio for ",". Reconnecting...");
 }
 static void link_lost(struct app*a){
  if(wlog_begin(a,a->clock(),"ERR link_lost")){wlog_raw(a,"errors=");wlog_dec(a,(long)a->errors);wlog_raw(a," last_rc=");wlog_dec(a,a->last_rc);wlog_end(a,1);}
- stop_audio(a);a->dropped=1;a->failed=0;a->next_try=a->clock()+2000000;
+ stop_audio(a);note_recovery(a,"link_lost");a->dropped=1;a->failed=0;a->next_try=a->clock()+2000000;
  say(a,""," disconnected. TV sound is back. Reconnecting...");
  if(may_announce(a,1)){notify("Bluetooth headphones disconnected. TV sound is back on. Reconnecting...");a->announced=1;}
 }
@@ -299,7 +318,9 @@ static void bluetooth_tick(struct app*a,u64 now){
     if(wlog_begin(a,now,"bt_ev")){
      wlog_raw(a,"type=");wlog_dec(a,ev[i].type);wlog_raw(a," sub=");wlog_dec(a,ev[i].subtype);
      wlog_raw(a," data=");wlog_hex(a,ev[i].data);wlog_raw(a," addr=");wlog_mac(a,ev[i].address);
-     wlog_raw(a," target=");wlog_dec(a,is_target);wlog_end(a,is_target);
+     wlog_raw(a," target=");wlog_dec(a,is_target);
+     if(a->streaming){a->bt_ev_stream++;wlog_raw(a," DURING_STREAM pkts=");wlog_dec(a,(long)a->packets);wlog_raw(a," since_nonzero_ms=");wlog_dec(a,a->last_nonzero_at?(long)((now-a->last_nonzero_at)/1000):-1);}
+     wlog_end(a,is_target||a->streaming);
     }
    }
    if(is_target&&a->wanted){
@@ -492,6 +513,9 @@ static void audio_tick(struct app*a,u64 now){
  }
  apply_volume_boost(a,pcm,&peak);
  struct audio_req req={a->target.address,pcm,sizeof(pcm),a->joint?4:3,0};a->last_rc=sc3(54,a->bt,0x80206216,(long)&req);
+ {u64 sq=0;for(unsigned i=0;i<384;i++){long v=pcm[i];sq+=(u64)(v*v);}u64 ms=sq/384;u32 r=0;for(u32 b=1u<<15;b;b>>=1){u32 t=r|b;if((u64)t*t<=ms)r=t;}a->last_rms=r;
+  if(peak>64){a->pkt_nonzero++;a->last_nonzero_at=now;}else a->pkt_zero++;
+  if(a->last_rc==(long)sizeof(pcm)){a->rc_full++;a->last_accept_at=now;}else if(a->last_rc>0){a->rc_partial++;a->last_accept_at=now;}else if(a->last_rc==0)a->rc_zero++;else a->rc_neg++;}
  {u64 done=a->clock();struct second*s=&a->cur;s->pkts++;
   if(a->last_rc==0)s->refused++;else if(a->last_rc<0)s->failed++;
   if(a->last_send){u64 gap=now-a->last_send;if(gap>s->maxgap_us)s->maxgap_us=(u32)(gap>0xffffffffUL?0xffffffffUL:gap);if(gap>8000)s->late8++;if(gap>16000)s->late16++;if(gap>50000)s->late50++;}
@@ -543,6 +567,10 @@ static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
  struct writer w={out,0,cap};append(&w,"{\"version\":\"" BTA_VERSION "\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
  field(&w,"volume",a->volume);field(&w,"volume_max",400);field(&w,"gain_pct",a->gain_pct);field(&w,"auto_recover",a->auto_recover);field(&w,"recover_ms",a->recover_ms);field(&w,"recover_limit",a->recover_limit);field(&w,"sender_sleep_us",a->sender_sleep_us);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_burst_secs",a->refused_burst_secs);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
+ field(&w,"pkt_zero",a->pkt_zero);field(&w,"pkt_nonzero",a->pkt_nonzero);field(&w,"rc_full",a->rc_full);field(&w,"rc_partial",a->rc_partial);field(&w,"rc_zero",a->rc_zero);field(&w,"rc_neg",a->rc_neg);field(&w,"pcm_rms",a->last_rms);
+ field(&w,"since_nonzero_ms",a->last_nonzero_at?(long)((now-a->last_nonzero_at)/1000):-1);field(&w,"since_accept_ms",a->last_accept_at?(long)((now-a->last_accept_at)/1000):-1);field(&w,"since_recovery_ms",a->last_recovery_at?(long)((now-a->last_recovery_at)/1000):-1);field(&w,"since_mode0_ms",a->last_mode0_at?(long)((now-a->last_mode0_at)/1000):-1);
+ field(&w,"recoveries",a->recoveries);field(&w,"mode0_sent",a->mode0_sent);field(&w,"no_mode0",a->no_mode0);field(&w,"btstate_recovery",a->btstate_recovery);field(&w,"bt_ev_stream",a->bt_ev_stream);
+ if(a->ring){field(&w,"cap_writepos",(long)(u32)(*(volatile u64*)(a->ring+8)>>32));field(&w,"cap_readpos",(long)a->readpos);}
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
  for(unsigned i=0;i<a->devices.count;i++){struct bt_device*d=&a->devices.items[i];if(!bt_is_audio(d)&&d->address!=a->target.address)continue;
@@ -629,7 +657,14 @@ static unsigned diagnostics_json(struct app*a,char*out,unsigned cap){
  if(a->prio_rc||a->aff_rc||a->pi_rc<0)diag_item(&w,&first,"schedule","warn","Sender scheduling","One or more real-time scheduling attributes were not accepted.","Use 500 us first. Do not force CPU affinity or priority on unsupported firmware.");
  else diag_item(&w,&first,"schedule","pass","Sender scheduling","Thread scheduling setup returned no recorded errors.","No action needed.");
  diag_item(&w,&first,"settings","pass","Saved settings","Recovery and sender settings are stored on the PS4.","Settings survive restarting the payload.");
- if(exists(WORKER_LOG))diag_item(&w,&first,"log","pass","Diagnostic log","The worker log is readable from this dashboard.","Use Copy full report to share a snapshot.");
+ if(a->streaming){u64 now=a->clock();
+  if(a->last_nonzero_at&&now-a->last_nonzero_at<2000000&&a->last_accept_at&&now-a->last_accept_at<2000000)diag_item(&w,&first,"pcm","pass","Non-silent audio queued","Non-zero PCM was generated and the Bluetooth driver queued it in the last 2 seconds. This still does not prove the headphones played it.","If the headphones are silent now, the fault is below this app (driver or headphone media channel): keep the full report.");
+  else if(a->last_accept_at&&now-a->last_accept_at<2000000)diag_item(&w,&first,"pcm","warn","Only silence is being sent","Packets are accepted by the driver but every recent packet is silent (peak <= 64).","Play the Test sound. If the tone is heard, game capture is silent; if not, the Bluetooth media path is stuck.");
+  else diag_item(&w,&first,"pcm","warn","No packet accepted recently","The driver has not queued a packet in the last 2 seconds.","Check refusals in timing and the log.");
+ }
+ long lfd=sc3(5,(long)WORKER_LOG,0,0);char lb[1];long lr=lfd>=0?sc3(3,lfd,(long)lb,1):-1;if(lfd>=0)closefd(lfd);
+ if(lr>0)diag_item(&w,&first,"log","pass","Diagnostic log","The worker log file opened and returned data.","If the dashboard still shows HTTP 403 for the log, include the browser address used.");
+ else if(lfd>=0)diag_item(&w,&first,"log","warn","Diagnostic log","The worker log file exists but is empty.","Start a connection attempt, then refresh the report.");
  else diag_item(&w,&first,"log","warn","Diagnostic log","No worker log file is present yet.","Start a connection attempt, then refresh the report.");
  append(&w,"]}");return w.used;
 }
@@ -649,12 +684,14 @@ static void manual_reconnect(struct app*a,int full){
 }
 static void dispatch(struct app*a,struct client*c){
  char body[12000];
+ /* Read-only log tail: served even when the Host header check fails, so a report
+  * never loses the log (v1.6.1 reports showed HTTP 403 here). */
+ if(starts(c->input,"GET /api/log HTTP/1.")||starts(c->input,"GET /api/log?")){unsigned n=read_log_tail(body,sizeof(body));response(c,"200 OK","text/plain; charset=utf-8",body,n);return;}
  if(!host_valid(c->input)){response(c,"403 Forbidden","text/plain","Use the PS4 IP address.",23);return;}
  if(starts(c->input,"GET / HTTP/1.")){response(c,"200 OK","text/html; charset=utf-8",web_page,sizeof(web_page)-1);return;}
  if(starts(c->input,"GET /api/native HTTP/1.")){unsigned n=native_status(a,body);response(c,"200 OK","application/octet-stream",body,n);return;}
  if(starts(c->input,"GET /api/status HTTP/1.")){unsigned n=status(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
  if(starts(c->input,"GET /api/timing HTTP/1.")){unsigned n=timing_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
- if(starts(c->input,"GET /api/log HTTP/1.")||starts(c->input,"GET /api/log?")){unsigned n=read_log_tail(body,sizeof(body));response(c,"200 OK","text/plain; charset=utf-8",body,n);return;}
   if(starts(c->input,"GET /api/diagnostics HTTP/1.")){unsigned n=diagnostics_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
  char*control=header(c->input,"x-bta-control");
  if(!starts(c->input,"POST ")||!control||!starts(control,"1\r\n")){response(c,"403 Forbidden","text/plain","Control header required.",24);return;}
@@ -728,6 +765,12 @@ static void dispatch(struct app*a,struct client*c){
    if(v){if(put(NO_WIDEN,"1",1)){response(c,"500 Internal Server Error","text/plain","Cannot save setting.",20);return;}}
    else if(exists(NO_WIDEN)&&sc3(10,(long)NO_WIDEN,0,0)<0){response(c,"500 Internal Server Error","text/plain","Cannot save setting.",20);return;}
    a->no_widen=(int)v;if(wlog_begin(a,a->clock(),"cmd_setting")){wlog_raw(a,"no_widen=");wlog_dec(a,v);wlog_raw(a," apply=next_connect");wlog_end(a,0);}
+  }
+  else if(starts(c->input,"POST /api/settings/no-mode0/")){
+   unsigned v;if(route_number(c->input,"POST /api/settings/no-mode0/",&v)!=1||v>1){response(c,"400 Bad Request","text/plain","Invalid setting.",16);return;}
+   if(v){if(put(NO_MODE0,"1",1)){response(c,"500 Internal Server Error","text/plain","Cannot save setting.",20);return;}}
+   else if(exists(NO_MODE0)&&sc3(10,(long)NO_MODE0,0,0)<0){response(c,"500 Internal Server Error","text/plain","Cannot save setting.",20);return;}
+   a->no_mode0=(int)v;if(wlog_begin(a,a->clock(),"cmd_setting")){wlog_raw(a,"no_mode0=");wlog_dec(a,v);wlog_end(a,1);}
   }
   else if(starts(c->input,"POST /api/restart-audio HTTP/1.")){if(!a->target.address){response(c,"409 Conflict","text/plain","Select headphones first.",24);return;}manual_reconnect(a,0);}
   else if(starts(c->input,"POST /api/reconnect HTTP/1.")){if(!a->target.address){response(c,"409 Conflict","text/plain","Select headphones first.",24);return;}manual_reconnect(a,1);}
@@ -804,7 +847,7 @@ void*bta_worker(void*arg){
  struct app a;memset(&a,0,sizeof(a));a.listener=(long)arg;a.bt=a.hdmi=a.shmfd=-1;a.muted=-1;a.wanted=0;for(int i=0;i<4;i++)a.clients[i].fd=-1;
  if(resolve("sceKernelUsleep",&a.sleep)||resolve("sceKernelGetProcessTime",&a.clock)||resolve("shm_open",&a.shm)||resolve("mmap",&a.map)||resolve("munmap",&a.unmap)||!a.sleep||!a.clock||!a.shm||!a.map||!a.unmap){closefd(a.listener);return 0;}
  sc3(136,(long)"/data/bta_audio",0777,0);sc3(15,(long)"/data/bta_audio",0777,0);sc3(10,(long)BTA_STOP,0,0);
- load_target(&a);load_joint(&a);load_volume(&a);load_settings(&a);a.tv=exists(TV_ON);a.no_widen=exists(NO_WIDEN);a.hdmi=sc3(5,(long)"/dev/hdmi",2,0);
+ load_target(&a);load_joint(&a);load_volume(&a);load_settings(&a);a.tv=exists(TV_ON);a.no_widen=exists(NO_WIDEN);a.no_mode0=exists(NO_MODE0);a.hdmi=sc3(5,(long)"/dev/hdmi",2,0);
  message(&a,"Ready. Select your headphones and press Connect.");notify("Bluetooth Audio is ready and idle. Open the home-screen app, then press Connect. Web controls: http://127.0.0.1:8097/ (or your PS4 IP on port 8097).");
  init_lock(&a);start_sender(&a);
  {u64 t0=a.clock();
@@ -814,7 +857,7 @@ void*bta_worker(void*arg){
    wlog_raw(&a,"v=" BTA_VERSION " fw=");wlog_str(&a,swv?sw.text:"unknown");wlog_raw(&a," fw_hex=");wlog_hex(&a,swv);
    wlog_raw(&a," hdmi_fd=");wlog_dec(&a,a.hdmi);wlog_raw(&a," tv=");wlog_dec(&a,a.tv);
    wlog_raw(&a," vol=");wlog_dec(&a,a.volume);wlog_raw(&a," joint=");wlog_dec(&a,a.joint);
-   wlog_raw(&a," no_widen=");wlog_dec(&a,a.no_widen);
+   wlog_raw(&a," no_widen=");wlog_dec(&a,a.no_widen);wlog_raw(&a," no_mode0=");wlog_dec(&a,a.no_mode0);
    if(a.target.address){wlog_raw(&a," saved=");wlog_mac(&a,a.target.address);wlog_raw(&a," name=");wlog_str(&a,a.target.name);}
    wlog_end(&a,1);
   }

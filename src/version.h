@@ -1,6 +1,6 @@
 #ifndef BTA_VERSION_H
 #define BTA_VERSION_H
 
-#define BTA_VERSION "1.6.5"
+#define BTA_VERSION "1.6.6"
 
 #endif
